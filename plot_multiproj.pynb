@@ -1,0 +1,1420 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu May 30 17:18:51 2024
+
+@author: charlesamory
+"""
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import itertools
+
+import numpy as np
+import numpy.ma as ma # masked array
+import xarray as xr
+import matplotlib as mpl
+import matplotlib.colors as colors
+from matplotlib import pyplot as plt
+from matplotlib import cm
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.legend_handler import HandlerLine2D
+from matplotlib import ticker as mticker
+
+#import plotlib as pls
+
+
+import matplotlib.gridspec as gridspec
+
+
+import shade2D as shade
+
+
+plt.close('all')
+
+# =============================================================================
+# Definition of ICE MASK ; used color maps, 
+# =============================================================================
+MSK,ice,lsm,ground,shelf,x2D,y2D,sh,dh,rock,ice_msk,grd_msk = shade.ice_masking()
+
+# =============================================================================
+# 2. CREATE the ICE MASK 
+# =============================================================================
+test = xr.open_dataset('/Users/dashakan/Desktop/scripts_AIS/MARcst-AN35km-176x148.cdf2'
+                       ,decode_times=False,engine="netcdf4")
+#test=test.rename_dims({'x':'X', 'y':'Y'}) #change dim name
+#Only AIS=1, other islands  =0
+ais = test['AIS'].where(test['AIS'] >0) 
+#Ice where ICE mask >= 30% (ICE[0-100%], dividing by 100 in the next ligne)
+ice= test['ICE'].where(test['ICE']>30)  
+#Combine ais + ice/100 * factor area for taking into account the projection deformation
+ice_msk = (ais*ice*test['AREA']/ 100)    
+
+#ground mask
+grd=test['GROUND'].where (test['GROUND']>30)# & (test['SH']<1000) )
+grd_msk = (ais*grd*test['AREA']/ 100)
+
+#ice-shelf mask
+shf=test['ICE'].where((test['ICE']>30) & (test['GROUND']<50) & (test['ROCK']<30))
+shf_msk=(shf*test['AREA'])/100
+
+rig=test['RIGNOT']
+west=shf.where((rig==1) | (rig==2) | (rig==9) | (rig==14) | (rig==18)  | (rig==24) | (rig==24.5) | (rig==19) | (rig==19.5) |(rig==20) | (rig==20.5 ) )
+west_msk=(west*test['AREA'])/100.
+
+east=shf.where( (rig==3) | (rig==4) | (rig==5) | (rig==10) | (rig==12)  | (rig==23)  | (rig==23.5) | (rig==6) | (rig==7) | (rig==8) | (rig==11) | (rig==13)  | (rig==21) | (rig==22) | (rig==21.5) | (rig==22) )
+east_msk=(east*test['AREA'])/100.
+
+peni = shf.where((rig==15) | (rig==16) | (rig==17) | (rig==15) | (rig==25)  | (rig==25.5) | (rig==26) | (rig==26.5))
+peni_msk=(peni*test['AREA'])/100.
+
+
+cmap_seq, cmap_smb, cmap_div, cmap_qual, cmap_BuRd, obs_color, sh_color, cmap_Puor = shade.def_cmaps()
+
+dpi=300
+
+def preprocess(ds):
+    '''
+    Avoid reading/opening the whole ds. => Selection of interesting variable
+    Also try to remove SECTOR dimension 
+    (Sector=1 corresponds to the ice sheet in MAR (2= tundra or rocks))
+    '''
+    #ds_new = ds['ME', 'RU', 'RF', 'SF', 'SU','SMB']
+    ds_new = ds
+    try:
+        ds_new= ds_new.sel(SECTOR=1) #SMB RU SU
+        ds_new= ds_new.sel(SECTOR1_1=1) #SMB RU SU
+        ds_new['TT']=ds_new['TT'].sel(ATMLAY=0.99973)
+        #ds_new['Ablation area']=(ds_new['SMB']<0)
+        #ds_new['Ablation area']=(ds_new['SF']+ds_new['RF']-ds_new['ER']-ds_new['RU']-ds_new['SU'])<0
+        #ds_new['Runoff area']=(ds_new['RU']>1)
+        #ds_new['Runoff area']=(ds_new['RU']>ds_new['SF'])
+        ds_new['Melt area']=(ds_new['ME']>1)
+        #ds_new['Erosion area']=((ds_new['ER']/ds_new['SF'])>0.5)
+        ds_new['Erosion area']=((ds_new['ER']>ds_new['SF']))
+        
+    except:
+        ds_new=ds_new
+    try:
+        ds_new= ds_new.sel(SECTOR1_1=1) #SMB RU SU
+
+    except:
+        ds_new=ds_new
+    try:
+        ds_new=ds_new.rename_dims({'x':'X','y':'Y'})
+        #ds_new=ds_new.rename_vars({'x':'X','y':'Y'})
+    except:
+        ds_new=ds_new
+        
+    
+    # try:
+    # #     ds_new['IDX']= ds_new['IDX'].sel(SECTOR1_1=1) #ME
+    #      ds_new['ME']= ds_new['ME'].sel(SECTOR1_1=1) #ME
+    # except:
+    # #     ds_new['IDX']=ds_new['IDX'] 
+    #      ds_new['ME']=ds_new['ME'] 
+    # try:
+    #     ds_new= ds_new.sel(SECTOR='1')
+    # except:
+    #     ds_new=ds_new
+    # try:
+    #     ds_new= ds_new.sel(SECTOR1_1='1')
+    # except:
+    #     ds_new=ds_new
+    return ds_new
+
+
+def SMBcomponents_to_gt(SMB_array, variable,mask, data_start=1980, data_end=2100,reso=35):
+    '''This function returns a daily time series of absolute SMB
+    component values, expressed as gigatons.
+    35 000 m = MAR resolution
+    1e12 factor to convert kg/m² in Gt
+     mask= [~0-~1] values weighted by 1) ice fraction 2) area factor related to proj
+    '''
+    reso=reso*1000
+    data = SMB_array[variable] * mask.values
+    # Make sure only wanted time frame is used
+    data = data.loc[str(data_start) + '-01-01':str(data_end) + '-12-31']
+    # Convert to gigatons and sum up spatially over the AIS
+    sum_spatial = data.sum(dim=['X', 'Y']
+                           ) * ((reso * reso) / (1e12))
+
+    return sum_spatial
+
+def date(ys,ye,freq='AS'):
+    if freq=='AS':
+        return pd.date_range(str(ys)+'-01-01', str(ye)+'-01-01', freq=freq)
+    if freq=='D':
+        return pd.date_range(str(ys)+'-01-01', str(ye)+'-12-31', freq=freq)
+
+def spcolor(var2D,cmap,bounds,sig):
+    return shade.spcolor(x2D,y2D,var2D,cmap,bounds,dh,sig)
+
+def spcolor2(var2D,cmap,sig,vmin,vmax):
+    return shade.spcolor2(x2D,y2D,var2D,cmap,dh,sig,vmin,vmax)
+
+def annual_mean(data):
+    '''
+    This function returns the annual sum
+    '''
+    annual_mean = data.mean(dim='TIME')
+    return annual_mean
+
+def compute_ano(df,refs,refe,period):
+    '''
+    This function returns a ds(!) with the anomalie compared to the reference period (refs--refe)
+    + a rolling mean (period)
+    '''
+    dfo= df - df.sel(TIME=slice(str(refs)+'-01-01',str(refe)+'-01-01')).mean(dim=['TIME'])
+    dfor= dfo.rolling(TIME=period, center=True).mean()
+    return dfor 
+
+def compute_int(list_SMB, variables, list_names,msk, data_start, data_end,season='annual'):
+    #df = pd.DataFrame()
+    df=list_SMB.copy()
+    for var in variables:
+        SMB_ts = SMBcomponents_to_gt(
+            list_SMB, var, msk, data_start, data_end)
+        if var =='EI':
+            data=list_SMB['EI']
+            SMB_ts=spatial_mean(data,msk)
+        if var =='Ablation area'or var =='Runoff area' or var =='Melt area' or var =='Erosion area' or var =='Sublimation area':
+            SMB_ts=extent(list_SMB, var, msk, data_start, data_end)
+        df[var] = SMB_ts
+
+    return df
+
+def spatial_mean(SMB_array, variable,mask, data_start=1980, data_end=2100):
+    '''
+    This function returns the spatial mean
+    '''
+    data = SMB_array[variable] * mask.values
+    data = data.loc[str(data_start) + '-01-01':str(data_end) + '-12-31']
+    mean_spatial =data.mean(dim=['X', 'Y'])
+    
+
+    return mean_spatial
+
+def compute_ave(list_SMB, variables, list_names,msk, data_start, data_end,season='annual'):
+    '''
+    This function returns a ds(!) with the original variables but averaged
+    spatially over the ice sheet/region
+    '''
+    df=list_SMB.copy()
+    for var in variables:
+        var_ts = spatial_mean(list_SMB, var, msk, data_start, data_end)
+        df[var] = var_ts
+
+    return df
+
+def extent(SMB_array, variable,mask, data_start=1980, data_end=2100):
+    '''This function returns a time series of the (Melt/Ru/ablation) extent of the ice sheet area,
+    expressed as %.
+    35 000 m = MAR resolution
+    1e12 factor to convert kg/m² in Gt
+    '''
+    
+    data = SMB_array[variable] * mask.values
+    # Make sure only wanted time frame is used
+    data = data.loc[str(data_start) + '-01-01':str(data_end) + '-12-31']
+    # Convert to gigatons and sum up spatially over the AIS
+    sum_spatial = data.sum(dim=['X', 'Y']) * (35 * 35) 
+    
+    ice_extent= mask.sum(dim=['X', 'Y']) * (35 * 35)
+    
+    fraction=sum_spatial*100/ice_extent
+
+    return fraction
+
+
+from matplotlib.colors import ListedColormap, LinearSegmentedColormap
+cmapblue = LinearSegmentedColormap.from_list("", ["white","navy"])
+cmapin= cm.get_cmap('BrBG')
+newcmp = ListedColormap(cmapin(np.linspace(0, 0.5, 128)))
+#top = cm.get_cmap('Oranges_r', 128)
+top=newcmp
+bottom = cm.get_cmap('Blues', 128)
+#bottom=cmapblue
+newcolors = np.vstack((top(np.linspace(0, 1, 128)),
+                       bottom(np.linspace(0, 1, 128))))
+newcmp = ListedColormap(newcolors, name='BlOr')
+    
+# =============================================================================
+# 3. OPEN MAR outputs
+# =============================================================================
+
+#A MAR NON DRIFT
+#Definition of the period. WARNING
+dates = pd.date_range('1980-01-01', '2100-01-01', freq='AS') 
+
+
+UKMr = xr.open_mfdataset('/Users/dashakan/Desktop/scripts_AIS/year-MAR-nDS_UKM-1980-2100.nc',decode_times=False,preprocess=preprocess,engine="netcdf4")
+UKMr['TIME']=dates
+UKMr['P']=UKMr['SF']+UKMr['RF']
+UKMr['Runoff area']=UKMr['RU']>UKMr['P']
+UKMr['Ablation area']=UKMr['SMB']<0
+
+MPIr = xr.open_mfdataset('/Users/dashakan/Desktop/scripts_AIS/year-MAR-nDS_MPI-1980-2100.nc', decode_times=False,preprocess=preprocess,engine="netcdf4") 
+MPIr['TIME']=dates
+MPIr['P']=MPIr['SF']+MPIr['RF']
+MPIr['Runoff area']=MPIr['RU']>MPIr['P']
+MPIr['Ablation area']=MPIr['SMB']<0
+
+CM6r = xr.open_mfdataset('/Users/dashakan/Desktop/scripts_AIS/year-MAR-nDS_CNRM-1980-2100.nc', decode_times=False,preprocess=preprocess,engine="netcdf4")
+CM6r['TIME']=dates
+CM6r['P']=CM6r['SF']+CM6r['RF']
+CM6r['Runoff area']=CM6r['RU']>CM6r['P']
+CM6r['Ablation area']=CM6r['SMB']<0
+
+IPLr = xr.open_mfdataset('/Users/dashakan/Desktop/scripts_AIS/year-MAR-nDS_IPL-1980-2100.nc', decode_times=False,preprocess=preprocess,engine="netcdf4")
+IPLr['TIME']=dates
+IPLr['P']=IPLr['SF']+IPLr['RF']
+IPLr['Runoff area']=IPLr['RU']>IPLr['P']
+IPLr['Ablation area']=IPLr['SMB']<0
+
+# Not visible one
+#CM2r = xr.open_mfdataset('./data_melt/year-MAR-nDS_CESM2-1980-2100.nc', decode_times=False,preprocess=preprocess,engine="netcdf4")
+#CM2r = xr.open_mfdataset('./data_melt/year-MAR_CESM2v2-1980-2100.nc', decode_times=False,preprocess=preprocess,engine="netcdf4")
+#CM2r['TIME']=dates
+#CM2r['P']=CM2r['SF']+CM2r['RF']
+#CM2r['Runoff area']=CM2r['RU']>CM2r['P']
+#CM2r['Ablation area']=CM2r['SMB']<0
+   
+list_mod_ref = []
+list_mod_ref=[UKMr,CM6r,MPIr,IPLr]
+#list_mod_ref=[UKMr,CM6r,MPIr,IPLr,CM2r]
+list_mod_names = []
+list_mod_names=['UKM','CM6','MPI', 'IPL']
+#list_mod_names=['UKM','CM6','MPI', 'IPL','CM2']
+
+
+#B MAR DRIFT
+#Definition of the period. WARNING
+dates = pd.date_range('1980-01-01', '2100-01-01', freq='AS') 
+
+UKM = xr.open_mfdataset('/Users/dashakan/Desktop/scripts_AIS/year-MAR-DS_UKM-1980-2100.nc',decode_times=False,preprocess=preprocess,engine="netcdf4")
+UKM['TIME']=dates
+UKM['P']=UKMr['SF']+UKM['RF']
+UKM['Runoff area']=UKM['RU']>UKM['P']
+#UKM['Runoff area']=UKM['RU']>(UKM['SF']+UKM['RF'])
+UKM['Sublimation area']=UKM['SU']>UKM['P']
+#UKM['Sublimation area']=UKM['SU']>(UKM['SF']+UKM['RF']-UKM['ER'])
+#UKM['Ablation area']=UKM['SMB'].where((UKM['SMB']<0) | (UKM['RU']>UKM['P']) | (UKM['SU']>UKM['P']) | (UKM['ER']>UKM['P']))
+#UKM['Ablation area']=UKM['RU']>UKM['P']
+#UKM['Ablation area']=UKM['P']
+#UKM['Ablation area']=UKM['SMB']<0
+#UKM['Ablation area']=UKM['Ablation area'].where((UKM['RU']>UKM['P']) | (UKM['SMB']<0) | (UKM['SU']>UKM['P']) | (UKM['ER']>UKM['P']))
+#UKM['Ablation area']=UKM['SMB'].where((UKM['RU']>UKM['P']) | (UKM['SMB']<0) | (UKM['SU']>UKM['P']) | (UKM['ER']>UKM['P']))
+#UKM['Erosion area']=(UKM['SF']+UKM['RF']-UKM['ER'])<UKMr['P']
+
+UKM['Erosion area']=UKM['ER']>(UKM['SF']+UKM['RF'])
+UKM['Runoff area']=UKM['RU']>(UKM['SF']+UKM['RF']-UKM['ER'])
+UKM['Ablation area']=(UKM['SF']+UKM['RF']-UKM['ER']-UKM['RU']-UKM['SU'])<0
+
+MPI = xr.open_mfdataset('/Users/dashakan/Desktop/scripts_AIS/year-MAR-DS_MPI-1980-2100.nc', decode_times=False,preprocess=preprocess,engine="netcdf4") 
+MPI['TIME']=dates
+MPI['P']=MPIr['SF']+MPI['RF']
+MPI['Runoff area']=MPI['RU']>MPI['P']
+#MPI['Runoff area']=MPI['RU']>(MPI['SF']+MPI['RF'])
+MPI['Sublimation area']=MPI['SU']>MPI['P']
+#MPI['Sublimation area']=MPI['SU']>(MPI['SF']+MPI['RF']-MPI['ER'])
+#MPI['Ablation area']=MPI['RU']>MPI['P']
+#MPI['Ablation area']=MPI['P']
+#MPI['Ablation area']=MPI['SMB']<0
+#MPI['Ablation area']=MPI['Ablation area'].where((MPI['RU']>MPI['P']) | (MPI['SMB']<0) | (MPI['SU']>MPI['P']) | (MPI['ER']>MPI['P']))
+#MPI['Ablation area']=MPI['SMB'].where((MPI['RU']>MPI['P']) | (MPI['SMB']<0) | (MPI['SU']>MPI['P']) | (MPI['ER']>MPI['P']))
+#MPI['Erosion area']=(MPI['SF']+MPI['RF']-MPI['ER'])<MPIr['P']
+
+MPI['Erosion area']=MPI['ER']>(MPI['SF']+MPI['RF'])
+MPI['Runoff area']=MPI['RU']>(MPI['SF']+MPI['RF']-MPI['ER'])
+MPI['Ablation area']=(MPI['SF']+MPI['RF']-MPI['ER']-MPI['RU']-MPI['SU'])<0
+
+
+CM6 = xr.open_mfdataset('/Users/dashakan/Desktop/scripts_AIS/year-MAR-DS_CNRM-1980-2100.nc', decode_times=False,preprocess=preprocess,engine="netcdf4")
+CM6['TIME']=dates
+CM6['P']=CM6r['SF']+CM6['RF']
+CM6['Runoff area']=CM6['RU']>CM6['P']
+#CM6['Runoff area']=CM6['RU']>(CM6['SF']+CM6['RF'])
+CM6['Sublimation area']=CM6['SU']>CM6['P']
+#CM6['Sublimation area']=CM6['SU']>(CM6['SF']+CM6['RF']-CM6['ER'])
+#CM6['Ablation area']=CM6['RU']>CM6['P']
+#CM6['Ablation area']=CM6['P']
+#CM6['Ablation area']=CM6['SMB']<0
+#CM6['Ablation area']=CM6['Ablation area'].where((CM6['RU']>CM6['P']) | (CM6['SMB']<0 ) | (CM6['SU']>CM6['P']) | (CM6['ER']>CM6['P']))
+#CM6['Ablation area']=CM6['SMB'].where((CM6['RU']>CM6['P']) | (CM6['SMB']<0 ) | (CM6['SU']>CM6['P']) | (CM6['ER']>CM6['P']))
+#CM6['Erosion area']=(CM6['SF']+CM6['RF']-CM6['ER'])<CM6r['P']
+
+CM6['Erosion area']=CM6['ER']>(CM6['SF']+CM6['RF'])
+CM6['Runoff area']=CM6['RU']>(CM6['SF']+CM6['RF']-CM6['ER'])
+CM6['Ablation area']=(CM6['SF']+CM6['RF']-CM6['ER']-CM6['RU']-CM6['SU'])<0
+
+
+IPL = xr.open_mfdataset('/Users/dashakan/Desktop/scripts_AIS/year-MAR-DS_IPL-1980-2100.nc', decode_times=False,preprocess=preprocess,engine="netcdf4")
+IPL['TIME']=dates
+IPL['P']=IPLr['SF']+IPL['RF']
+#IPL['Runoff area']=IPL['RU']>IPL['P']
+#IPL['Runoff area']=IPL['RU']>(IPL['SF']+IPL['RF'])
+IPL['Sublimation area']=IPL['SU']>IPL['P']
+#IPL['Ablation area']=IPL['RU']>IPL['P']
+#IPL['Ablation area']=IPL['P']
+#IPL['Ablation area']=IPL['SMB']<0
+#IPL['Ablation area']=IPL['Ablation area'].where((IPL['RU']>IPL['P']) | (IPL['SMB']<0 ) | (IPL['SU']>IPL['P']) | (IPL['ER']>IPL['P']))
+#IPL['Ablation area']=IPL['SMB'].where((IPL['RU']>IPL['P']) | (IPL['SMB']<0 ) | (IPL['SU']>IPL['P']) | (IPL['ER']>IPL['P']))
+#IPL['Erosion area']=(IPL['SF']+IPL['RF']-IPL['ER'])<IPLr['P']
+
+IPL['Erosion area']=IPL['ER']>(IPL['SF']+IPL['RF'])
+IPL['Runoff area']=IPL['RU']>(IPL['SF']+IPL['RF']-IPL['ER'])
+IPL['Ablation area']=(IPL['SF']+IPL['RF']-IPL['ER']-IPL['RU']-IPL['SU'])<0
+
+# ! not visible dataset
+#CM2 = xr.open_mfdataset('./data_melt/year-MAR-DS_CESM2-1980-2100.nc', decode_times=False,preprocess=preprocess,engine="netcdf4")
+#CM2['TIME']=dates
+#CM2['P']=CM2r['SF']+CM2['RF']
+#CM2['Erosion area']=CM2['ER']>(CM2['SF']+CM2['RF'])
+#CM2['Runoff area']=CM2['RU']>CM2['P']
+#CM2['Sublimation area']=CM2['SU']>CM2r['P']
+#CM2['Ablation area']=CM2['SMB'].where((CM2['SMB']<0) | (CM2['RU']>CM2['P']) | (CM2['SU']>CM2['P']) | (CM2['ER']>CM2['P']))
+
+
+   
+list_mod_bs = []
+list_mod_bs=[UKM,CM6,MPI,IPL]
+#list_mod_bs=[UKM,CM6,MPI,IPL,CM2]
+     
+## =============================================================================
+# 4. COMPUTE AVERAGED VALUES + (rolling) ANOMALIES for all the variables
+# =============================================================================
+
+#rolling mean period 
+rolling=1
+#definition of the variables
+vars_SMB = ['P','SMB','SF','RF','ME','RU','SU','Ablation area','Runoff area','Melt area']
+#vars_mean = ['TT','SHF','LWD','SWD','IWP','CWP','LHF','AL2','WVP']
+vars_mean=['TT']
+
+result_ice_dic = {}
+result_ice_ano_dic={}
+
+result_grd_dic={}
+result_grd_ano_dic={}
+
+result_shf_dic={}
+result_shf_ano_dic={}
+
+###################
+### A. No drift ###
+###################
+
+## i) compute spatially integrated anomalies
+
+for i in range(len(list_mod_ref)):
+    print (list_mod_names[i])
+    #ALL AIS
+    dfi=compute_int(list_mod_ref[i], vars_SMB, list_mod_names[i],ice_msk, 1980, 2100)
+    result_ice_dic[list_mod_names[i]]=dfi   
+    dfano=compute_ano(dfi,1981,2010,rolling)
+    result_ice_ano_dic[list_mod_names[i]]=dfano
+        
+    #Grounded only
+    dfg=compute_int(list_mod_ref[i], vars_SMB, list_mod_names[i],grd_msk, 1980, 2100)
+    result_grd_dic[list_mod_names[i]]=dfg 
+    dfano=compute_ano(dfg,1981,2010,rolling)
+    result_grd_ano_dic[list_mod_names[i]]=dfano   
+      
+    #Shelves only
+    dfs=compute_int(list_mod_ref[i], vars_SMB, list_mod_names[i],shf_msk, 1980, 2100)
+    result_shf_dic[list_mod_names[i]]=dfs  
+    dfano=compute_ano(dfs,1981,2010,rolling)
+    result_shf_ano_dic[list_mod_names[i]]=dfano
+
+
+ref_dic = {}
+ref_dic['ice']=result_ice_dic
+ref_dic['grd']=result_grd_dic
+ref_dic['shelf']=result_shf_dic
+ref_dic_ano = {}
+ref_dic_ano['ice']=result_ice_ano_dic
+ref_dic_ano['grd']=result_grd_ano_dic
+ref_dic_ano['shelf']=result_shf_ano_dic
+
+
+## ii) compute spatially averaged anomalies
+
+result_ice_dic = {}
+result_ice_ano_dic={}
+result_grd_dic={}
+result_grd_ano_dic={}
+result_shf_dic={}
+result_shf_ano_dic={}
+
+for i in range(len(list_mod_ref)):
+    print (list_mod_names[i])
+    #ALL AIS
+    dfi=compute_ave(list_mod_ref[i], vars_mean, list_mod_names[i],ice_msk, 1980, 2099)
+    result_ice_dic[list_mod_names[i]]=dfi    
+    dfano=compute_ano(dfi,1981,2010,rolling)
+    result_ice_ano_dic[list_mod_names[i]]=dfano
+        
+    #Grounded only
+    dfg=compute_ave(list_mod_ref[i], vars_mean, list_mod_names[i],grd_msk, 1980, 2099)
+    result_grd_dic[list_mod_names[i]]=dfg    
+    dfano=compute_ano(dfg,1981,2010,rolling)
+    result_grd_ano_dic[list_mod_names[i]]=dfano   
+    
+    
+    #Shelves only
+    dfs=compute_ave(list_mod_ref[i], vars_mean, list_mod_names[i],shf_msk, 1980, 2099)
+    result_shf_dic[list_mod_names[i]]=dfs 
+    dfano=compute_ano(dfs,1981,2010,rolling)
+    result_shf_ano_dic[list_mod_names[i]]=dfano
+
+ref_dicm = {}
+ref_dicm['ice']=result_ice_dic
+ref_dicm['grd']=result_grd_dic
+ref_dicm['shelf']=result_shf_dic
+ref_dicm_ano = {}
+ref_dicm_ano['ice']=result_ice_ano_dic
+ref_dicm_ano['grd']=result_grd_ano_dic
+ref_dicm_ano['shelf']=result_shf_ano_dic
+
+
+
+################
+### B. Drift ###
+################
+
+## i) compute spatially integrated anomalies
+
+result_ice_dic = {}
+result_ice_ano_dic={}
+
+result_grd_dic={}
+result_grd_ano_dic={}
+
+result_shf_dic={}
+result_shf_ano_dic={}
+
+vars_SMB = ['SMB','SF','RF','ME','RU','SU','ER','Ablation area','Runoff area','Melt area','Erosion area', 'Sublimation area']
+
+
+for i in range(len(list_mod_bs)):
+    print (list_mod_names[i])
+    #ALL AIS
+    dfi=compute_int(list_mod_bs[i], vars_SMB, list_mod_names[i],ice_msk, 1980, 2100)
+    result_ice_dic[list_mod_names[i]]=dfi   
+    dfano=compute_ano(dfi,1981,2010,rolling)
+    result_ice_ano_dic[list_mod_names[i]]=dfano
+        
+    #Grounded only
+    dfg=compute_int(list_mod_bs[i], vars_SMB, list_mod_names[i],grd_msk, 1980, 2100)
+    result_grd_dic[list_mod_names[i]]=dfg 
+    dfano=compute_ano(dfg,1981,2010,rolling)
+    result_grd_ano_dic[list_mod_names[i]]=dfano   
+      
+    #Shelves only
+    dfs=compute_int(list_mod_bs[i], vars_SMB, list_mod_names[i],shf_msk, 1980, 2100)
+    result_shf_dic[list_mod_names[i]]=dfs  
+    dfano=compute_ano(dfs,1981,2010,rolling)
+    result_shf_ano_dic[list_mod_names[i]]=dfano
+    
+    
+bs_dic = {}
+bs_dic['ice']=result_ice_dic
+bs_dic['grd']=result_grd_dic
+bs_dic['shelf']=result_shf_dic
+
+bs_dic_ano = {}
+bs_dic_ano['ice']=result_ice_ano_dic
+bs_dic_ano['grd']=result_grd_ano_dic
+bs_dic_ano['shelf']=result_shf_ano_dic
+
+ablation_dic = {}
+ablation_dic['ice'] = {}
+ablation_dic['grd'] = {}
+ablation_dic['shelf'] = {}
+ablation_dic['TIME'] = pd.date_range('1980-01-01', '2100-01-01', freq='AS')
+
+area_dic = {}
+area_dic['ice'] = {}
+area_dic['grd'] = {}
+area_dic['shelf'] = {}
+area_dic['TIME'] = pd.date_range('1980-01-01', '2100-01-01', freq='AS')
+
+#models = ['UKM','CM6','MPI', 'IPL','CM2']
+years = pd.date_range(start='1980-01-01', periods=121, freq='YS')
+#data = np.random.rand(len(list_mod_names), len(years)) # que tu remplis plus tard avec tes vraies valeurs
+
+
+## ii) compute spatially averaged anomalies
+
+result_ice_dic = {}
+result_ice_ano_dic={}
+result_grd_dic={}
+result_grd_ano_dic={}
+result_shf_dic={}
+result_shf_ano_dic={}
+
+for i in range(len(list_mod_bs)):
+    print (list_mod_names[i])
+    #ALL AIS
+    dfi=compute_ave(list_mod_bs[i], vars_mean, list_mod_names[i],ice_msk, 1980, 2100)
+    result_ice_dic[list_mod_names[i]]=dfi    
+    dfano=compute_ano(dfi,1981,2010,rolling)
+    result_ice_ano_dic[list_mod_names[i]]=dfano
+        
+    #Grounded only
+    dfg=compute_ave(list_mod_bs[i], vars_mean, list_mod_names[i],grd_msk, 1980, 2100)
+    result_grd_dic[list_mod_names[i]]=dfg    
+    dfano=compute_ano(dfg,1981,2010,rolling)
+    result_grd_ano_dic[list_mod_names[i]]=dfano   
+    
+    
+    #Shelves only
+    dfs=compute_ave(list_mod_bs[i], vars_mean, list_mod_names[i],shf_msk, 1980, 2100)
+    result_shf_dic[list_mod_names[i]]=dfs 
+    dfano=compute_ano(dfs,1981,2010,rolling)
+    result_shf_ano_dic[list_mod_names[i]]=dfano
+
+bs_dicm = {}
+bs_dicm['ice']=result_ice_dic
+bs_dicm['grd']=result_grd_dic
+bs_dicm['shelf']=result_shf_dic
+bs_dicm_ano = {}
+bs_dicm_ano['ice']=result_ice_ano_dic
+bs_dicm_ano['grd']=result_grd_ano_dic
+bs_dicm_ano['shelf']=result_shf_ano_dic
+
+
+############################
+### C. Relative ablation ###
+############################
+
+data_er = pd.DataFrame(columns=list_mod_names, index=years)
+data_ru_nds = pd.DataFrame(columns=list_mod_names, index=years)
+data_ru_ds = pd.DataFrame(columns=list_mod_names, index=years)
+data_su_nds = pd.DataFrame(columns=list_mod_names, index=years)
+data_su_ds = pd.DataFrame(columns=list_mod_names, index=years)
+
+reg_list=["ice","grd","shelf"]
+for reg in reg_list:
+    for mod in range(len(list_mod_names)):
+        #df=(bs_dic[reg][list_mod_names[mod]]['ER']/bs_dic[reg][list_mod_names[mod]]['SF']*100)
+        df=( (ref_dic[reg][list_mod_names[mod]]['P']-(bs_dic[reg][list_mod_names[mod]]['SF'] + bs_dic[reg][list_mod_names[mod]]['RF'] - bs_dic[reg][list_mod_names[mod]]['ER']))/ ref_dic[reg][list_mod_names[mod]]['P']*100)
+        bs_dic[reg][list_mod_names[mod]]['relative_ablation_ER']=df
+        data_er[list_mod_names[mod]]=df
+    
+        ref_dic[reg][list_mod_names[mod]]['relative_ablation_ER']=df*0
+        # data[list_mod_names[mod]][:]=df
+        
+        # if reg == 'shelf':
+        # # Create the DataArray
+        #     ablation_sh_er= xr.DataArray(
+        #     data,
+        #     dims=['model', 'time'],
+        #     coords={'model': list_mod_names, 'time': years},
+        #     name='relative ablation')
+            
+        # if reg == 'grd':
+        # # Create the DataArray
+        #     ablation_gd_er= xr.DataArray(
+        #     data,
+        #     dims=['model', 'time'],
+        #     coords={'model': list_mod_names, 'time': years},
+        #     name='relative ablation')
+    
+        
+        df=(ref_dic[reg][list_mod_names[mod]]['RU']/ref_dic[reg][list_mod_names[mod]]['P']*100)
+        ref_dic[reg][list_mod_names[mod]]['relative_ablation_RU']=df
+        data_ru_nds[list_mod_names[mod]]=df
+        
+        df=(bs_dic[reg][list_mod_names[mod]]['RU']/ref_dic[reg][list_mod_names[mod]]['P']*100)
+        bs_dic[reg][list_mod_names[mod]]['relative_ablation_RU']=df
+        data_ru_ds[list_mod_names[mod]]=df
+        
+        df=(ref_dic[reg][list_mod_names[mod]]['SU']/ref_dic[reg][list_mod_names[mod]]['P']*100)
+        ref_dic[reg][list_mod_names[mod]]['relative_ablation_SU']=df
+        data_su_nds[list_mod_names[mod]]=df
+        
+        df=(bs_dic[reg][list_mod_names[mod]]['SU']/ref_dic[reg][list_mod_names[mod]]['P']*100)
+        bs_dic[reg][list_mod_names[mod]]['relative_ablation_SU']=df
+        data_su_ds[list_mod_names[mod]]=df
+        
+        
+        # data[list_mod_names[mod]][:]=df
+        
+        # if reg == 'shelf':
+        # # Create the DataArray
+        #     ablation_sh_ru_= xr.DataArray(
+        #     data,
+        #     dims=['model', 'time'],
+        #     coords={'model': list_mod_names, 'time': years},
+        #     name='relative ablation')
+            
+        # if reg == 'grd':
+        # # Create the DataArray
+        #     ablation_gd_ru= xr.DataArray(
+        #     data,
+        #     dims=['model', 'time'],
+        #     coords={'model': list_mod_names, 'time': years},
+        #     name='relative ablation')
+
+        
+    ablation_dic[reg]["erosion"]=  data_er.iloc[:, :5].mean(axis=1)
+    ablation_dic[reg]["erosion_std"]= data_er.iloc[:, :5].std(axis=1)
+    
+    ablation_dic[reg]["runoff_nds"]= data_ru_nds.iloc[:, :5].mean(axis=1)
+    ablation_dic[reg]["runoff_nds_std"]= data_ru_nds.iloc[:, :5].std(axis=1)
+    
+    ablation_dic[reg]["runoff_ds"]= data_ru_ds.iloc[:, :5].mean(axis=1)
+    ablation_dic[reg]["runoff_ds_std"]= data_ru_ds.iloc[:, :5].std(axis=1)
+    
+    ablation_dic[reg]["sublimation_nds"]= data_su_nds.iloc[:, :5].mean(axis=1)
+    ablation_dic[reg]["sublimation_nds_std"]= data_su_nds.iloc[:, :5].std(axis=1)
+    
+    ablation_dic[reg]["sublimation_ds"]= data_su_ds.iloc[:, :5].mean(axis=1)
+    ablation_dic[reg]["sublimation_ds_std"]= data_su_ds.iloc[:, :5].std(axis=1)
+    
+    #tentative de faire une moyenne inter-modèle sur le dic 
+    #total = sum(item.get(key,0) for item in dict_list) / len(dict_list)
+    #mean =  sum(item[] for item in bs_dic[reg][list_mod_bs]['ablation']) / len(bs_dic[reg]   
+    #df=bs_dic[reg][list_mod_names]['ablation'].mean()
+    #ablation_dic[reg]=df
+ 
+
+
+#.mean(dim=‘model’) après ou .std aussi si tu veux ajouter une zone grise autour
+
+# def temp_anom_to_SMB_grd(ds):
+#     ds['SMB'] = -1.3(ds.TAS**2) + 115.4(ds.TAS) -11.1
+#     ds['SMB'] = ds['SMB'].sel(YEAR=slice(1980,2100))
+#     ds['STD'] = ds.SMB.std(dim='MODEL')
+    
+#D Ablation, Erosion and Runoff areas
+data_area_ab = pd.DataFrame(columns=list_mod_names, index=years)
+data_area_er = pd.DataFrame(columns=list_mod_names, index=years)
+data_area_ru = pd.DataFrame(columns=list_mod_names, index=years)
+data_area_su = pd.DataFrame(columns=list_mod_names, index=years)
+
+reg_list=["ice","grd","shelf"]
+for reg in reg_list:
+    for mod in range(len(list_mod_names)):
+        
+        data_area_ab[list_mod_names[mod]]=bs_dic[reg][list_mod_names[mod]]['Ablation area']
+        data_area_er[list_mod_names[mod]]=bs_dic[reg][list_mod_names[mod]]['Erosion area']
+        data_area_ru[list_mod_names[mod]]=bs_dic[reg][list_mod_names[mod]]['Runoff area']
+        data_area_su[list_mod_names[mod]]=bs_dic[reg][list_mod_names[mod]]['Sublimation area']
+                
+        
+    area_dic[reg]["Ablation"]=  data_area_ab.iloc[:, :5].mean(axis=1)
+    area_dic[reg]["Ablation_std"]= data_area_ab.iloc[:, :5].std(axis=1)
+    
+    area_dic[reg]["Erosion"]= data_area_er.iloc[:, :5].mean(axis=1)
+    area_dic[reg]["Erosion_std"]= data_area_er.iloc[:, :5].std(axis=1)
+    
+    area_dic[reg]["Runoff"]= data_area_ru.iloc[:, :5].mean(axis=1)
+    area_dic[reg]["Runoff_std"]= data_area_ru.iloc[:, :5].std(axis=1)
+    
+    area_dic[reg]["Sublimation"]= data_area_su.iloc[:, :5].mean(axis=1)
+    area_dic[reg]["Sublimation_std"]= data_area_su.iloc[:, :5].std(axis=1)
+    
+    
+        
+def timeseries(var):
+    '''
+    #Série temporelle grounded vs shelves pour SMB, ME, RU, SU, ER/SF
+    '''
+    #list_letter   = ['(a)','(b)'] 
+    list_letter   = ['',''] 
+    
+    nrow=1
+    ncol=2  
+    list_mod_names_l=['UKESM1-0-LL','CNRM-CM6-1','MPI-ESM1-2-HR','IPSL-CM6A-LR']
+    #list_mod_names_l=['UKESM1-0-LL','CNRM-CM6-1','MPI-ESM1-2-HR','IPSL-CM6A-LR','CESM2']
+    list_color=['navy','goldenrod','firebrick','saddlebrown']
+    #list_color=['navy','slategrey','steelblue','lightsteelblue','cornflowerblue','royalblue']
+    
+    vars_SMB = ['SMB','RU','ME','SU']
+    vars_abla = ['Ablation area','Runoff area','Melt area','Erosion area','Sublimation area']
+    vars_mean = ['TT','SHF','LWD','SWD','AL2','IWP','CWP']
+    
+    if var in vars_SMB:
+        ref=ref_dic
+        bs=bs_dic
+        #ref=ref_dic_ano
+        #bs=bs_dic_ano
+        unit='(Gt yr$^{-1}$)'
+    else:
+        ref=ref_dicm_ano
+        bs=bs_dicm_ano
+        unit=' '
+    
+    if var in vars_abla:
+        ref=ref_dic
+        bs=bs_dic
+        unit='(%)'
+#    ymin=-300
+#    ymax=800
+
+    fig, ax2 = plt.subplots(nrows=nrow,ncols=ncol,figsize=(12,4))
+    
+    for i in range(len(list_mod_names)):
+        
+        #ref['grd'][list_mod_names[i]][var].cumsum().plot(ax=ax2[0],
+        ref['grd'][list_mod_names[i]][var].plot(ax=ax2[0],
+                      color=list_color[i],label=list_mod_names_l[i])
+        #bs['grd'][list_mod_names[i]][var].cumsum().plot(ax=ax2[0],
+        bs['grd'][list_mod_names[i]][var].plot(ax=ax2[0],
+                      color=list_color[i],linestyle='dashed')
+        
+        #ref['shelf'][list_mod_names[i]][var].cumsum().plot(ax=ax2[1],
+        ref['shelf'][list_mod_names[i]][var].plot(ax=ax2[1],
+                      color=list_color[i],label=list_mod_names_l[i])
+        #bs['shelf'][list_mod_names[i]][var].cumsum().plot(ax=ax2[1],
+        bs['shelf'][list_mod_names[i]][var].plot(ax=ax2[1],
+                      color=list_color[i],linestyle='dashed')
+        if var == 'ME':
+            dfref=ref['shelf'][list_mod_names[i]]['ME'].cumsum().sel(TIME=slice('2100-01-01','2100-01-01')).mean(dim=['TIME'])
+            dfbs=bs['shelf'][list_mod_names[i]]['ME'].cumsum().sel(TIME=slice('2100-01-01','2100-01-01')).mean(dim=['TIME'])
+            df=(dfbs-dfref)*100/dfref
+            print(list_mod_names[i])
+            print(df.values)
+         
+    #ax2[0].set_ylabel(var+' anomaly '+unit, fontsize=16)
+    #ax2[0].set_ylabel('Cumulative anomaly '+unit, fontsize=16)
+    #ax2[0].set_ylabel('Anomaly '+unit, fontsize=16)
+    ax2[0].set_ylabel(var+' '+unit, fontsize=16)
+    ax2[0].set_xlabel('', fontsize=5)
+    ax2[0].tick_params(axis="x", labelsize=14) 
+    ax2[0].tick_params(axis="y", labelsize=14)
+    ax2[0].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[0].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[0].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[0].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    #ax2[0].axhline(color='black', alpha=1,lw=1)
+    ax2[0].set_title("", fontsize=0)
+    ax2[0].text(0.9, 0.05, list_letter[0],fontsize=14, transform=ax2[0].transAxes, fontdict={'weight': 'bold'})
+
+
+    #ax2[1].set_ylabel('Cumulative '+var+' anomaly '+unit, fontsize=16)
+    #ax2[1].set_ylabel('Cumulative anomaly '+unit, fontsize=16)
+    ax2[1].set_ylabel('', fontsize=16)
+    ax2[1].set_xlabel('', fontsize=14)
+    ax2[1].tick_params(axis="x", labelsize=14) 
+    ax2[1].tick_params(axis="y", labelsize=14)
+    ax2[1].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[1].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[1].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[1].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    #ax2[1].axhline(color='black', alpha=1,lw=1)
+    ax2[1].set_title("", fontsize=0)
+    ax2[1].text(0.9, 0.05, list_letter[1],fontsize=14, transform=ax2[1].transAxes, fontdict={'weight': 'bold'})
+
+
+    ax2[1].legend(frameon=False, prop={'size': 14})#,loc='upper right')
+    ax2[0].set_title("Grounded ice", fontsize=18)
+    ax2[1].set_title("Ice shelves", fontsize=18)
+    plt.tight_layout() 
+    sns.despine()
+    plt.show()
+    #fig.savefig(var+'_ano_CMIP6.png',format='PNG', dpi=200)
+    fig.savefig(var+'_CMIP6.png',format='PNG', dpi=200)
+    
+def timeseries_erosion(var='Erosion area'):
+    '''
+    '''
+    #list_letter   = ['(a)','(b)'] 
+    list_letter   = ['',''] 
+    
+    nrow=1
+    ncol=2  
+    #list_mod_names_l=['UKESM1-0-LL','CNRM-CM6-1','MPI-ESM1-2-HR','IPSL-CM6A-LR','CESM2']
+    list_mod_names_l=['UKESM1-0-LL','CNRM-CM6-1','MPI-ESM1-2-HR','IPSL-CM6A-LR']
+    list_color=['navy','slategrey','steelblue','lightsteelblue','cornflowerblue','royalblue']
+    
+    bs=bs_dic
+    unit='(%)'
+
+    fig, ax2 = plt.subplots(nrows=nrow,ncols=ncol,figsize=(12,4))
+    
+    for i in range(len(list_mod_names)):
+        
+        bs['grd'][list_mod_names[i]][var].plot(ax=ax2[0],
+                      color=list_color[i],label=list_mod_names_l[i])
+        
+        bs['shelf'][list_mod_names[i]][var].plot(ax=ax2[1],
+                      color=list_color[i],label=list_mod_names_l[i])
+       
+    ax2[0].set_ylabel(var+' '+unit, fontsize=16)
+    ax2[0].set_xlabel('', fontsize=5)
+    ax2[0].tick_params(axis="x", labelsize=14) 
+    ax2[0].tick_params(axis="y", labelsize=14)
+    ax2[0].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[0].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[0].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[0].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    #ax2[0].axhline(color='black', alpha=1,lw=1)
+    ax2[0].set_title("", fontsize=0)
+    ax2[0].text(0.9, 0.05, list_letter[0],fontsize=14, transform=ax2[0].transAxes, fontdict={'weight': 'bold'})
+
+
+    #ax2[1].set_ylabel('Cumulative '+var+' anomaly '+unit, fontsize=16)
+    #ax2[1].set_ylabel('Cumulative anomaly '+unit, fontsize=16)
+    ax2[1].set_ylabel('', fontsize=16)
+    ax2[1].set_xlabel('', fontsize=14)
+    ax2[1].tick_params(axis="x", labelsize=14) 
+    ax2[1].tick_params(axis="y", labelsize=14)
+    ax2[1].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[1].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[1].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[1].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    #ax2[1].axhline(color='black', alpha=1,lw=1)
+    ax2[1].set_title("", fontsize=0)
+    ax2[1].text(0.9, 0.05, list_letter[1],fontsize=14, transform=ax2[1].transAxes, fontdict={'weight': 'bold'})
+
+
+    ax2[1].legend(frameon=False, prop={'size': 14})#,loc='upper right')
+    ax2[0].set_title("Grounded ice", fontsize=18)
+    ax2[1].set_title("Ice shelves", fontsize=18)
+    plt.tight_layout() 
+    sns.despine()
+    plt.show()
+    #fig.savefig(var+'_ano_CMIP6.png',format='PNG', dpi=200)
+    fig.savefig(var+'_CMIP6.png',format='PNG', dpi=200)
+
+def plot_ablation(var):
+    '''
+    #Série temporelle grounded vs shelves pour SMB, ME, RU, SU, ER/SF
+    '''
+    #list_letter   = ['(a)','(b)'] 
+    list_letter   = ['',''] 
+    
+    nrow=1
+    ncol=2  
+    #list_mod_names_l=['UKESM1-0-LL','CNRM-CM6-1','MPI-ESM1-2-HR','IPSL-CM6A-LR','CESM2']
+    list_mod_names_l=['UKESM1-0-LL','CNRM-CM6-1','MPI-ESM1-2-HR','IPSL-CM6A-LR']
+    list_color=['navy','goldenrod','firebrick','saddlebrown','darkslategrey']
+    #list_color=['navy','goldenrod','firebrick','saddlebrown']
+    
+    ref=ref_dic
+    bs=bs_dic
+    unit=' (% of precip.)'
+#    else:
+#        ref=ref_dicm_ano
+#        bs=bs_dicm_ano
+#        unit=' '
+    
+#    ymin=-300
+#    ymax=800
+
+    fig, ax2 = plt.subplots(nrows=nrow,ncols=ncol,figsize=(12,4))
+    for i in range(len(list_mod_names)):
+        
+        #ref['grd'][list_mod_names[i]][var].cumsum().plot(ax=ax2[0],
+        ref['grd'][list_mod_names[i]][var].plot(ax=ax2[0],
+                      color=list_color[i],label=list_mod_names_l[i])
+        #bs['grd'][list_mod_names[i]][var].cumsum().plot(ax=ax2[0],
+        bs['grd'][list_mod_names[i]][var].plot(ax=ax2[0],
+                      color=list_color[i],linestyle='dashed')
+        
+        #ref['shelf'][list_mod_names[i]][var].cumsum().plot(ax=ax2[1],
+        ref['shelf'][list_mod_names[i]][var].plot(ax=ax2[1],
+                      color=list_color[i],label=list_mod_names_l[i])
+        #bs['shelf'][list_mod_names[i]][var].cumsum().plot(ax=ax2[1],
+        bs['shelf'][list_mod_names[i]][var].plot(ax=ax2[1],
+                      color=list_color[i],linestyle='dashed')
+
+         
+    #ax2[0].set_ylabel(var+' anomaly '+unit, fontsize=16)
+    #ax2[0].set_ylabel('Cumulative anomaly '+unit, fontsize=16)
+    ax2[0].set_ylabel(var+unit, fontsize=14)
+    ax2[0].set_xlabel('', fontsize=5)
+    ax2[0].tick_params(axis="x", labelsize=14) 
+    ax2[0].tick_params(axis="y", labelsize=14)
+    ax2[0].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[0].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[0].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[0].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    ax2[0].axhline(color='black', alpha=1,lw=1)
+    ax2[0].set_title("", fontsize=0)
+    ax2[0].text(0.9, 0.05, list_letter[0],fontsize=14, transform=ax2[0].transAxes, fontdict={'weight': 'bold'})
+
+
+    #ax2[1].set_ylabel('Cumulative '+var+' anomaly '+unit, fontsize=16)
+    #ax2[1].set_ylabel('Cumulative anomaly '+unit, fontsize=16)
+    #ax2[1].set_ylabel('', fontsize=16)
+    ax2[1].set_ylabel('Surface ablation '+unit, fontsize=14)
+    ax2[1].set_xlabel('', fontsize=5)
+    ax2[1].tick_params(axis="x", labelsize=14) 
+    ax2[1].tick_params(axis="y", labelsize=14)
+    ax2[1].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[1].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[1].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[1].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    ax2[1].axhline(color='black', alpha=1,lw=1)
+    ax2[1].set_title("", fontsize=0)
+    ax2[1].text(0.9, 0.05, list_letter[1],fontsize=14, transform=ax2[1].transAxes, fontdict={'weight': 'bold'})
+
+
+    ax2[1].legend(frameon=False, prop={'size': 14})#,loc='upper right')
+    ax2[0].set_title("Grounded ice", fontsize=18)
+    ax2[1].set_title("Ice shelves", fontsize=18)
+    plt.tight_layout() 
+    sns.despine()
+    plt.show()
+    fig.savefig(var+'_CMIP6.png',format='PNG', dpi=200)
+    
+    
+# =============================================================================
+# # OUT STORED IN DIC (key= reg => ice, grd, shelf)
+# =============================================================================  
+
+# #variables stored in 
+# ref_dic['ice']=result_ice_dic
+# ref_dic['grd']=result_grd_dic
+# ref_dic['shelf']=result_shf_dic
+
+# bs_dic['ice']=result_ice_dic
+# bs_dic['grd']=result_grd_dic
+# bs_dic['shelf']=result_shf_dic
+
+
+reg_list=["ice","grd","shelf"]
+
+
+        
+def plot_ablation_mean():
+
+    list_letter   = ['',''] 
+    
+    nrow=1
+    ncol=2
+    
+    unit='(% of precip.)'
+#    else:
+#        ref=ref_dicm_ano
+#        bs=bs_dicm_ano
+#        unit=' '
+    
+#    ymin=-300
+#    ymax=800
+     
+    fig, ax2 = plt.subplots(nrows=nrow,ncols=ncol,figsize=(12,4))
+   
+    #color=['goldenrod','navy']   
+    color=['lightsteelblue','navy','slategrey'] 
+    #color=['darkgreen','navy','lightsteelblue','firebrick','lightcoral'] 
+    #color=['lightsteelblue','navy','firebrick']#,'lightcoral'] 
+    
+    #erosion
+    ablation_dic['grd']['erosion'].plot(ax=ax2[0],
+                      color=color[0])
+
+    ax2[0].fill_between(years,ablation_dic['grd']['erosion']+1.64*ablation_dic['grd']['erosion_std'],
+                      ablation_dic['grd']['erosion']-1.64*ablation_dic['grd']['erosion_std'],
+                      color=color[0],alpha=0.2)
+                                                    
+    ablation_dic['shelf']['erosion'].plot(ax=ax2[1],
+                      color=color[0],label="Snow transport")
+    ax2[1].fill_between(years,ablation_dic['shelf']['erosion']+1.64*ablation_dic['shelf']['erosion_std'],
+                      ablation_dic['shelf']['erosion']-1.64*ablation_dic['shelf']['erosion_std'],
+                      color=color[0],alpha=0.2)
+    # #runoff nDS
+    # ablation_dic['grd']['runoff_nds'].plot(ax=ax2[0],
+    #                   color=color[1]) 
+    # ax2[0].fill_between(years,ablation_dic['grd']['runoff_nds']+1.64*ablation_dic['grd']['runoff_nds_std'],
+    #                   ablation_dic['grd']['runoff_nds']-1.64*ablation_dic['grd']['runoff_nds_std'],
+    #                   color=color[1],alpha=0.2)
+    
+    # ablation_dic['shelf']['runoff_nds'].plot(ax=ax2[1],
+    #                   color=color[1],label="Runoff without DS")
+    # ax2[1].fill_between(years,ablation_dic['shelf']['runoff_nds']+1.64*ablation_dic['shelf']['runoff_nds_std'],
+    #                   ablation_dic['shelf']['runoff_nds']-1.64*ablation_dic['shelf']['runoff_nds_std'],
+    #                   color=color[1],alpha=0.2)
+    #runoff DS
+    ablation_dic['grd']['runoff_ds'].plot(ax=ax2[0],
+                      color=color[1]) 
+    ax2[0].fill_between(years,ablation_dic['grd']['runoff_ds']+1.64*ablation_dic['grd']['runoff_ds_std'],
+                      ablation_dic['grd']['runoff_ds']-1.64*ablation_dic['grd']['runoff_ds_std'],
+                      color=color[1],alpha=0.2)
+    
+    ablation_dic['shelf']['runoff_ds'].plot(ax=ax2[1],
+                      color=color[1],label="Runoff")
+    ax2[1].fill_between(years,ablation_dic['shelf']['runoff_ds']+1.64*ablation_dic['shelf']['runoff_ds_std'],
+                      ablation_dic['shelf']['runoff_ds']-1.64*ablation_dic['shelf']['runoff_ds_std'],
+                      color=color[1],alpha=0.2)
+    
+    # #sublimation nDS
+    # ablation_dic['grd']['sublimation_nds'].plot(ax=ax2[0],
+    #                   color=color[2]) 
+    # ax2[0].fill_between(years,ablation_dic['grd']['sublimation_nds']+1.64*ablation_dic['grd']['sublimation_nds_std'],
+    #                   ablation_dic['grd']['sublimation_nds']-1.64*ablation_dic['grd']['sublimation_nds_std'],
+    #                   color=color[2],alpha=0.2)
+    
+    # ablation_dic['shelf']['sublimation_nds'].plot(ax=ax2[1],
+    #                   color=color[2],label="Sublimation without DS")
+    # ax2[1].fill_between(years,ablation_dic['shelf']['sublimation_nds']+1.64*ablation_dic['shelf']['sublimation_nds_std'],
+    #                   ablation_dic['shelf']['sublimation_nds']-1.64*ablation_dic['shelf']['sublimation_nds_std'],
+    #                   color=color[2],alpha=0.2)
+    #sublimation DS
+    ablation_dic['grd']['sublimation_ds'].plot(ax=ax2[0],
+                      color=color[2]) 
+    ax2[0].fill_between(years,ablation_dic['grd']['sublimation_ds']+1.64*ablation_dic['grd']['sublimation_ds_std'],
+                      ablation_dic['grd']['sublimation_ds']-1.64*ablation_dic['grd']['sublimation_ds_std'],
+                      color=color[2],alpha=0.2)
+    
+    ablation_dic['shelf']['sublimation_ds'].plot(ax=ax2[1],
+                      color=color[2],label="Surface sublimation")
+    ax2[1].fill_between(years,ablation_dic['shelf']['sublimation_ds']+1.64*ablation_dic['shelf']['sublimation_ds_std'],
+                      ablation_dic['shelf']['sublimation_ds']-1.64*ablation_dic['shelf']['sublimation_ds_std'],
+                      color=color[2],alpha=0.2)
+    
+         
+    #ax2[0].set_ylabel(var+' anomaly '+unit, fontsize=16)
+    #ax2[0].set_ylabel('Cumulative anomaly '+unit, fontsize=16)
+    ax2[0].set_ylabel('Surface ablation '+unit, fontsize=14)
+    ax2[0].set_xlabel('', fontsize=5)
+    ax2[0].tick_params(axis="x", labelsize=14) 
+    ax2[0].tick_params(axis="y", labelsize=14)
+    ax2[0].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[0].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[0].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[0].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    ax2[0].axhline(color='black', alpha=1,lw=1)
+    ax2[0].set_title("", fontsize=0)
+    #ax2[0].text(0.9, 0.05, list_letter[0],fontsize=14, transform=ax2[0].transAxes, fontdict={'weight': 'bold'})
+    ax2[0].text(0.9, 0.05, list_letter[0],fontsize=14, transform=ax2[0].transAxes, fontdict={'weight': 'bold'})
+    
+    ax2[1].legend(frameon=False, prop={'size': 16},loc='upper left')
+    
+    ymin=-7
+    ymax=22.5
+    ax2[0].set_ylim(ymin,ymax)
+    ymin=-70
+    ymax=225
+    ax2[1].set_ylim(ymin,ymax)
+    # xmin='1980-01-01'
+    # xmax='2100-01-01'
+    # #xmin=8
+    # #xmax=127
+    # ax2[0].set_xlim(xmin,xmax)
+    # ax2[1].set_xlim(xmin,xmax)
+
+    #ax2[1].set_ylabel('Surface ablation '+unit, fontsize=14)
+    ax2[1].set_xlabel('', fontsize=5)
+    ax2[1].tick_params(axis="x", labelsize=14) 
+    ax2[1].tick_params(axis="y", labelsize=14)
+    ax2[1].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[1].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[1].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[1].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    ax2[1].axhline(color='black', alpha=1,lw=1)
+    ax2[1].set_title("", fontsize=0)
+    ax2[1].text(0.9, 0.05, list_letter[1],fontsize=14, transform=ax2[1].transAxes, fontdict={'weight': 'bold'})
+
+
+    #ax2[1].legend(frameon=False, prop={'size': 14})#,loc='upper right')
+    ax2[0].set_title("Grounded ice", fontsize=18)
+    ax2[1].set_title("Ice shelves", fontsize=18)
+    plt.tight_layout() 
+    sns.despine()
+    plt.show()
+    fig.savefig('ablation_mean.png',format='PNG', dpi=200)
+    
+def plot_area_mean():
+
+    list_letter   = ['',''] 
+    
+    nrow=1
+    ncol=2
+    
+    unit='area (%)'
+     
+    fig, ax2 = plt.subplots(nrows=nrow,ncols=ncol,figsize=(12,4))
+   
+    color=['lightsteelblue','navy','slategrey','steelblue'] 
+    #color=['navy','slategrey','steelblue','lightsteelblue','cornflowerblue','royalblue']
+    
+
+    
+    #erosion
+    # area_dic['grd']['Erosion'].plot(ax=ax2[0],
+    #                   color=color[0])
+
+    # ax2[0].fill_between(years,area_dic['grd']['Erosion']+1.64*area_dic['grd']['Erosion_std'],
+    #                   area_dic['grd']['Erosion']-1.64*area_dic['grd']['Erosion_std'],
+    #                   color=color[0],alpha=0.2)
+                                                    
+    # area_dic['shelf']['Erosion'].plot(ax=ax2[1],
+    #                   color=color[0],label="Snow transport")
+    # ax2[1].fill_between(years,area_dic['shelf']['Erosion']+1.64*area_dic['shelf']['Erosion_std'],
+    #                   area_dic['shelf']['Erosion']-1.64*area_dic['shelf']['Erosion_std'],
+    #                   color=color[0],alpha=0.2)
+
+    #runoff DS
+    area_dic['grd']['Runoff'].plot(ax=ax2[0],
+                      color=color[1]) 
+    ax2[0].fill_between(years,area_dic['grd']['Runoff']+1.64*area_dic['grd']['Runoff_std'],
+                      area_dic['grd']['Runoff']-1.64*area_dic['grd']['Runoff_std'],
+                      color=color[1],alpha=0.2)
+    
+    area_dic['shelf']['Runoff'].plot(ax=ax2[1],
+                      color=color[1],label="Runoff")
+    ax2[1].fill_between(years,area_dic['shelf']['Runoff']+1.64*area_dic['shelf']['Runoff_std'],
+                      area_dic['shelf']['Runoff']-1.64*area_dic['shelf']['Runoff_std'],
+                      color=color[1],alpha=0.2)
+    
+    # #Sublimation
+    # area_dic['grd']['Sublimation'].plot(ax=ax2[0],
+    #                   color=color[2]) 
+    # ax2[0].fill_between(years,area_dic['grd']['Sublimation']+1.64*area_dic['grd']['Sublimation_std'],
+    #                   area_dic['grd']['Sublimation']-1.64*area_dic['grd']['Sublimation_std'],
+    #                   color=color[2],alpha=0.2)
+    
+    # area_dic['shelf']['Sublimation'].plot(ax=ax2[1],
+    #                   color=color[2],label="Sublimation")
+    # ax2[1].fill_between(years,area_dic['shelf']['Sublimation']+1.64*area_dic['shelf']['Sublimation_std'],
+    #                   area_dic['shelf']['Sublimation']-1.64*area_dic['shelf']['Sublimation_std'],
+    #                   color=color[2],alpha=0.2)
+    #ablation
+    area_dic['grd']['Ablation'].plot(ax=ax2[0],
+                      color=color[2]) 
+    ax2[0].fill_between(years,area_dic['grd']['Ablation']+1.64*area_dic['grd']['Ablation_std'],
+                      area_dic['grd']['Ablation']-1.64*area_dic['grd']['Ablation_std'],
+                      color=color[2],alpha=0.2)
+    
+    area_dic['shelf']['Ablation'].plot(ax=ax2[1],
+                      color=color[2],label="Total")
+    ax2[1].fill_between(years,area_dic['shelf']['Ablation']+1.64*area_dic['shelf']['Ablation_std'],
+                      area_dic['shelf']['Ablation']-1.64*area_dic['shelf']['Ablation_std'],
+                      color=color[2],alpha=0.2)
+    
+         
+    #ax2[0].set_ylabel(var+' anomaly '+unit, fontsize=16)
+    #ax2[0].set_ylabel('Cumulative anomaly '+unit, fontsize=16)
+    ax2[0].set_ylabel('Ablation '+unit, fontsize=14)
+    ax2[0].set_xlabel('', fontsize=5)
+    ax2[0].tick_params(axis="x", labelsize=14) 
+    ax2[0].tick_params(axis="y", labelsize=14)
+    ax2[0].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[0].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[0].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[0].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    ax2[0].axhline(color='black', alpha=1,lw=1)
+    ax2[0].set_title("", fontsize=0)
+    #ax2[0].text(0.9, 0.05, list_letter[0],fontsize=14, transform=ax2[0].transAxes, fontdict={'weight': 'bold'})
+    ax2[0].text(0.9, 0.05, list_letter[0],fontsize=14, transform=ax2[0].transAxes, fontdict={'weight': 'bold'})
+    
+    ax2[1].legend(frameon=False, prop={'size': 16},loc='upper left')
+    
+    ymin=-0
+    ymax=6
+    ax2[0].set_ylim(ymin,ymax)
+    ymin=0
+    ymax=60
+    ax2[1].set_ylim(ymin,ymax)
+    # xmin='1980-01-01'
+    # xmax='2100-01-01'
+    # #xmin=8
+    # #xmax=127
+    # ax2[0].set_xlim(xmin,xmax)
+    # ax2[1].set_xlim(xmin,xmax)
+
+    #ax2[1].set_ylabel('Surface ablation '+unit, fontsize=14)
+    ax2[1].set_xlabel('', fontsize=5)
+    ax2[1].tick_params(axis="x", labelsize=14) 
+    ax2[1].tick_params(axis="y", labelsize=14)
+    ax2[1].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[1].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[1].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[1].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)
+    
+    ax2[1].axhline(color='black', alpha=1,lw=1)
+    ax2[1].set_title("", fontsize=0)
+    ax2[1].text(0.9, 0.05, list_letter[1],fontsize=14, transform=ax2[1].transAxes, fontdict={'weight': 'bold'})
+
+
+    #ax2[1].legend(frameon=False, prop={'size': 14})#,loc='upper right')
+    ax2[0].set_title("Grounded ice", fontsize=18)
+    ax2[1].set_title("Ice shelves", fontsize=18)
+    plt.tight_layout() 
+    sns.despine()
+    plt.show()
+    fig.savefig('area_mean.png',format='PNG', dpi=200)
+
+
+def map2D(var, ds, ds_ref, what=''):
+    fig, gs = shade.set_fig() 
+    
+    dataplot=(ds[var]-ds_ref[var]).mean(dim=['TIME'])
+   
+    if var == 'SMB': 
+        plt.title("Surface mass balance [kg m$^{-2}$ y$^{-1}$]")
+        bounds=[-200,-100,0,100,200]
+        cmap=newcmp
+        extend='both'
+        
+     
+    if var == 'ME': 
+        plt.title("Surface melt [kg m$^{-2}$ y$^{-1}$]")
+        mskshade= (abs(dataplot)<1)
+        bounds=[-200,-100,0,100,200]
+        cmap=cmap=plt.get_cmap('RdBu_r')
+        dataplot=ma.array(dataplot,mask=mskshade)
+        extend='both'  
+        
+    
+    if var == 'RU': 
+        plt.title("Runoff [kg m$^{-2}$ y$^{-1}$]")  
+        bounds=[-50,-25,0,25,50]
+        cmap=cmap=plt.get_cmap('RdBu_r')
+        extend='both'
+        mskshade= (abs(dataplot)<0.1)
+        dataplot=ma.array(dataplot,mask=mskshade)
+        
+
+    dataplot=ma.array(dataplot,mask=lsm)
+    p=plt.pcolormesh(x2D+dh,y2D+dh,dataplot,cmap=cmap,vmin=min(bounds),vmax=max(bounds))
+    #plt.gca().set_xticklabels([])
+    #plt.gca().set_yticklabels([])
+    #plt.gca().set_xlabel("")
+    #plt.gca().set_ylabel("")
+    #plt.tick_params(bottom = False,left=False) 
+    plt.plot([-1000,0],[-1600,-1600],lw=3,color='k')
+    plt.text(-500,-1700,'1000 km',va='top',ha='center')
+    #shade.plot_graticules()
+    shade.layout(x2D,y2D,sh,lsm,ground)
+    fig.patch.set_visible(False)
+    plt.gca().axis('off')
+    
+    # add colorbar
+    cb_ax = fig.add_axes([.84,.068,.03,.863])
+    label="[kg m$^{-2}$ y$^{-1}$]"
+    
+    cbar=fig.colorbar(p,orientation='vertical',cax=cb_ax,extend=extend,label=label)
+    cbar.set_ticks(bounds)
+    cbar.ax.tick_params(labelsize='15')
+    cbar.set_ticklabels(bounds)
+    
+    fig.savefig(var+'_'+what+'.png',
+                format='PNG', dpi=500)
+    
+    
+def plotvst2m(ax2,dic,reg,var,legend='True',deg=2,mrk="o",fit_reg='True',s=8,lw=1,aplha=0.7,lwr=1.5,ls='solid'):
+   #MAR ano y
+   T2m=bs_dicm_ano[reg]['UKM']['TT'].values
+
+   CNRM_var=bs_dic[reg]['UKM'][var].values
+   CNRM_RU=bs_dic[reg]['UKM']['relative_ablation_RU'].values
+
+        
+   sns.regplot(x=T2m,y=CNRM_var,ax=ax2,order=deg,label='Snow transport', 
+                color='gold',marker=mrk,scatter_kws={"s": s, "alpha": aplha,"zorder":10},
+                line_kws={"linewidth": lw,"linestyle":ls}, ci=None,fit_reg=fit_reg,truncate=True) 
+   
+   sns.regplot(x=T2m,y=CNRM_RU,ax=ax2,order=deg,label='Runoff', 
+                color='mediumblue',marker=mrk,scatter_kws={"s": s, "alpha": aplha,"zorder":10},
+                line_kws={"linewidth": lw,"linestyle":ls}, ci=None,fit_reg=fit_reg,truncate=True) 
+  
+   ax2.set_xlabel('Near-surface temperature anomaly (°C)', fontsize=12)
+   ax2.set_ylabel('Relative ablation (% of Precip.)', fontsize=12)
+        
+   if legend!='False':
+       ax2.legend(frameon=False, prop={'size': 12})
+   ax2.axhline(color='black', alpha=1,lw=1)
+   return
+
+def plotvst2m2(ax2,dic,mod,reg,mrk,deg=2,fit_reg='False',s=8,lw=1,aplha=0.7,lwr=1.5,ls='solid'):
+
+   x=bs_dicm_ano[reg][mod]['TT'].values
+   y1=dic[reg][mod]['relative_ablation_ER'].values
+   y2=dic[reg][mod]['relative_ablation_RU'].values
+
+   
+   #ax2.scatter(x, y, s=60, alpha=0.7, edgecolors="k")    
+        
+   sns.regplot(x=x,y=y1,ax=ax2,order=deg,label='Snow transport', 
+                color='gold',marker=mrk,scatter_kws={"s": s, "alpha": aplha,"zorder":10},
+                line_kws={"linewidth": lw,"linestyle":ls}, ci=None,fit_reg=fit_reg,truncate=True) 
+   
+   sns.regplot(x=x,y=y2,ax=ax2,order=deg,label='Runoff', 
+                color='mediumblue',marker=mrk,scatter_kws={"s": s, "alpha": aplha,"zorder":10},
+                line_kws={"linewidth": lw,"linestyle":ls}, ci=None,fit_reg=fit_reg,truncate=True) 
+  
+   ax2.set_xlabel('Near-surface temperature anomaly (°C)', fontsize=12)
+   ax2.set_ylabel('Relative ablation (% of Precip.)', fontsize=12)
+        
+#   if legend!='False':
+#       ax2.legend(frameon=False, prop={'size': 12})
+   ax2.axhline(color='black', alpha=1,lw=1)
+   return
+
+def varvs():
+    nrow=1
+    ncol=2
+    lws=1.5
+
+    fig, ax2 = plt.subplots(nrows=nrow,ncols=ncol,figsize=(8,4))
+      
+    #list_mod_names=['UKM','CM6','MPI', 'IPL']
+    list_mod_names=['UKM','CM6','MPI', 'IPL','CM2']
+    list_mod_names=['UKM']
+    #list_mod_names_l=['UKESM1-0-LL','CNRM-CM6-1','MPI-ESM1-2-HR','IPSL-CM6A-LR','CESM2']
+    list_mod_names_l=['UKESM1-0-LL','CNRM-CM6-1','MPI-ESM1-2-HR','IPSL-CM6A-LR']
+    list_color=['navy','goldenrod','firebrick','saddlebrown']
+    #list_color=['navy','slategrey','steelblue','lightsteelblue','cornflowerblue','royalblue']
+    #list_marker=["o","s","^","D","+"]
+    list_marker=["o","s","^","+"]
+
+    ref=bs_dic
+    unit='(% of Precip.)'
+
+    for i in range(len(list_mod_names)):
+        #plotvst2m(ax2[0],ref,"grd",var,legend='True',deg=2,lwr=0,mrk="o")
+        #plotvst2m(ax2[1],ref,"shelf",var,legend='True',deg=2,lwr=0,mrk="o")
+        plotvst2m2(ax2[0],ref,list_mod_names[i],"grd",list_marker[i],deg=2,lwr=0)
+        plotvst2m2(ax2[1],ref,list_mod_names[i],"shelf",list_marker[i],deg=2,lwr=0)
+    
+    ax2[0].set_title("Grounded ice", fontsize=18) 
+    ax2[1].set_title("Ice shelves", fontsize=18)
+    plt.tight_layout()
+    sns.despine()
+    fig.savefig('Ablation_vs_T2m_UKM.png',
+                format='PNG', dpi=500)
+                 
+    #ax2[0].set_ylabel(var+' anomaly '+unit, fontsize=16)
+    #ax2[0].set_ylabel('Cumulative anomaly '+unit, fontsize=16) 
+    #ax2[0].set_ylabel('Anomaly '+unit, fontsize=16)
+    #ax2[0].set_ylabel(var+' '+unit, fontsize=16)
+    ax2[0].set_xlabel('', fontsize=5)
+    ax2[0].tick_params(axis="x", labelsize=14) 
+    ax2[0].tick_params(axis="y", labelsize=14)
+    ax2[0].yaxis.set_minor_locator(mticker.AutoMinorLocator(n=2))
+    ax2[0].tick_params(axis='y',which='major',direction='inout',left=True,right=False)
+    ax2[0].tick_params(axis='y',which='minor',direction='in',left=True,right=False)
+    ax2[0].tick_params(axis='x',which='major',direction='inout',top=False,bottom=True)    
+
+
+### plots ###
+#timeseries('SMB')
+#timeseries('SU')
+#timeserie()
+#plot_ablation('relative_ablation_ER')
+#plot_ablation('relative_ablation_RU')
+#plot_ablation_mean()
+#plot_area_mean()
+
+#timeseries('Ablation area') #comparer le % de zone d’ablation apparues entre DS et nDS sur présent et futur
+#timeseries('Runoff area')
+#timeseries('Melt area')
+#timeseries_erosion()
+
+varvs()
