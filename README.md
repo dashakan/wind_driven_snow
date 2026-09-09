@@ -23,7 +23,7 @@ loaded from https://imbie.org/
 Each notebook contains comments before each cell on how to run it and what is reproduced.
 
 - `plot_multiproj` — the main script written by Charles Amory. Defines dictionaries, opens files, and plots time series (SMB, SU, relative ablation, surface ablation components, ablation area, runoff area, melt area, erosion area). The following calculations in other notebooks are adapted from this script. 
-- `main_figures` - figures used in the main part
+- `main` - figures used in the main and extended data
 
 ### Environment
 channels: [conda-forge]
