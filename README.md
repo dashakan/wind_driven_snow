@@ -1,6 +1,7 @@
 ### MAR simulations
 MAR v3.11 at 35 km over the AIS, run with wind-driven snow scheme switched on and off. 
 Forced by CNRM-CM6-1, IPSL-CM6A-LR, MPI-ESM1-2-HR and UKESM1-0-LL (under SSP5-8.5).
+Simulations ran by Ch.A.
 
 Model description:
 (Amory et al., 2021)
