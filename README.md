@@ -25,7 +25,8 @@ Each notebook contains comments before each cell on how to run it and what is re
 
 - `plot_multiproj` — the main script written by Charles Amory. Defines dictionaries, opens files, and plots time series (SMB, SU, relative ablation, surface ablation components, ablation area, runoff area, melt area, erosion area). The following calculations in other notebooks are adapted from this script. 
 - `main` - figures used in the main and extended data
-
+- `exceedance` - runs on cache not to load ssp data
+ 
 ### Environment
 channels: [conda-forge]
 dependencies:
@@ -41,3 +42,5 @@ dependencies:
   - pyproj
   - jupyterlab
 
+### Authors
+Charles Amory, Vincent Favier, María Santolaria-Otín, Daria Kan 
